@@ -2,8 +2,8 @@
 /**
  * Plugin Name: PayPal IPN Fixer
  * Plugin URI: https://github.com/nicdwilson/paypal-ipn-fixer
- * Description: Fixes a bug in WooCommerce Subscriptions where renewal orders are not created when PayPal sends IPN notifications with -wcsfrp- in the invoice for renewal sign-ups after failure. Sets _paypal_failed_sign_up_recorded meta to prevent sign-up after failure flag.
- * Version: 1.2.0
+ * Description: Fixes a bug in WooCommerce Subscriptions where renewal orders are not created when PayPal sends IPN notifications with -wcsfrp- in the invoice for renewal sign-ups after failure. Creates new renewal orders when payments are processed on old failed orders.
+ * Version: 1.3.0
  * Author: WooCommerce Growth Team
  * Author URI: https://woocommerce.com
  * Text Domain: paypal-ipn-fixer
@@ -60,39 +60,44 @@ class PayPal_IPN_Fixer {
 	}
 
 	/**
+	 * Store the fixed invoice for this IPN request
+	 * 
+	 * @var string
+	 */
+	private static $fixed_invoice = null;
+	
+
+	/**
 	 * Initialize hooks
 	 */
 	private function init_hooks() {
 		// Hook into valid IPN request at priority -10 (before Subscriptions at 0)
-		// We'll set _paypal_failed_sign_up_recorded meta BEFORE Subscriptions processes,
-		// so when Subscriptions checks line 195, it will see the order ID already matches
-		// and won't set $is_renewal_sign_up_after_failure to true
-		add_action( 'valid-paypal-standard-ipn-request', array( $this, 'prevent_renewal_signup_after_failure_flag' ), -10 );
+		add_action( 'valid-paypal-standard-ipn-request', array( $this, 'fix_renewal_order_creation' ), -10 );
+		
+		// Filter meta retrieval to cast _paypal_failed_sign_up_recorded to integer
+		// WordPress stores all meta as strings, but Subscriptions uses strict comparison (line 195)
+		// This ensures the comparison works correctly
+		// Note: WooCommerce CRUD objects use this filter pattern: woocommerce_{object_type}_get_{meta_key}
+		add_filter( 'woocommerce_subscription_get__paypal_failed_sign_up_recorded', array( $this, 'cast_meta_to_integer' ), 10, 2 );
+		
+		// Also hook into get_post_meta as a fallback (for older WooCommerce versions or direct meta access)
+		add_filter( 'get_post_metadata', array( $this, 'cast_post_meta_to_integer' ), 10, 4 );
 	}
 
 	/**
-	 * Prevent $is_renewal_sign_up_after_failure from being set to true
+	 * Fix renewal order creation for -wcsfrp- IPNs
 	 * 
-	 * By setting _paypal_failed_sign_up_recorded to match the order ID from invoice
-	 * BEFORE Subscriptions processes the IPN, the condition on line 195 will fail:
+	 * The problem: When PayPal sends IPN with -wcsfrp-{order_id} in the invoice,
+	 * Subscriptions loads the old failed order and processes payment against it
+	 * instead of creating a new renewal order.
 	 * 
-	 * if ( wcs_get_objects_property( $transaction_order, 'id' ) !== $subscription->get_meta( '_paypal_failed_sign_up_recorded', true ) ) {
-	 *     $is_renewal_sign_up_after_failure = true;
-	 * }
-	 * 
-	 * If the order ID matches _paypal_failed_sign_up_recorded, $is_renewal_sign_up_after_failure
-	 * stays false, and Subscriptions will process it as a normal renewal.
+	 * Solution: 
+	 * Set _paypal_failed_sign_up_recorded meta to prevent $is_renewal_sign_up_after_failure flag,
+	 * ensuring Subscriptions creates a new renewal order instead of using the old failed order
 	 */
-	public function prevent_renewal_signup_after_failure_flag( $transaction_details ) {
+	public function fix_renewal_order_creation( $transaction_details ) {
 		// Only process subscr_payment transactions
 		if ( ( $transaction_details['txn_type'] ?? '' ) !== 'subscr_payment' ) {
-			$this->logger->debug( 
-				'PayPal IPN Fixer: Skipping - not a subscr_payment transaction',
-				array( 
-					'source' => 'paypal-ipn-fixer',
-					'txn_type' => $transaction_details['txn_type'] ?? 'NOT_SET',
-				)
-			);
 			return;
 		}
 
@@ -123,6 +128,10 @@ class PayPal_IPN_Fixer {
 			);
 			return;
 		}
+		
+		// Convert to integer to match the type returned by wcs_get_objects_property() at line 195
+		// This ensures the strict comparison ( !== ) works correctly
+		$order_id_from_invoice = absint( $order_id_from_invoice );
 
 		$old_order = wc_get_order( $order_id_from_invoice );
 		if ( ! $old_order ) {
@@ -199,29 +208,78 @@ class PayPal_IPN_Fixer {
 			return;
 		}
 
+		// Store the fixed invoice (without -wcsfrp- suffix) for potential use
+		self::$fixed_invoice = preg_replace( '/-wcsfrp-\d+$/', '', $invoice );
+		
 		// Set _paypal_failed_sign_up_recorded to match the order ID from invoice
-		// This will cause Subscriptions' check on line 195 to fail, preventing
-		// $is_renewal_sign_up_after_failure from being set to true
+		// This will cause Subscriptions' check on line 195 to pass (strict comparison),
+		// preventing $is_renewal_sign_up_after_failure from being set to true
+		// Note: We use absint() to ensure integer type matches wcs_get_objects_property() return type
 		$current_recorded = $subscription->get_meta( '_paypal_failed_sign_up_recorded', true );
 		
 		// Always update the meta to ensure it matches, even if it's already set
 		// This ensures the fix works even if the meta was set from a previous IPN
+		// Store as integer to match the type returned by wcs_get_objects_property( $transaction_order, 'id' )
 		$subscription->update_meta_data( '_paypal_failed_sign_up_recorded', $order_id_from_invoice );
 		$subscription->save();
 		
 		$this->logger->info( 
-			'PayPal IPN Fixer: Set _paypal_failed_sign_up_recorded to prevent $is_renewal_sign_up_after_failure flag',
+			'PayPal IPN Fixer: Set _paypal_failed_sign_up_recorded',
 			array( 
 				'source' => 'paypal-ipn-fixer',
 				'subscription_id' => $subscription_id,
 				'old_order_id' => $order_id_from_invoice,
 				'previous_recorded' => $current_recorded,
 				'new_recorded' => $order_id_from_invoice,
-				'txn_id' => $transaction_details['txn_id'] ?? 'NOT_SET',
 				'invoice' => $invoice,
 			)
 		);
 	}
+	
+	/**
+	 * Cast _paypal_failed_sign_up_recorded meta value to integer
+	 * 
+	 * WordPress stores all meta values as strings, but Subscriptions uses strict comparison
+	 * at line 195. This filter ensures the meta value is returned as an integer to match
+	 * the type returned by wcs_get_objects_property( $transaction_order, 'id' )
+	 * 
+	 * @param mixed $value The meta value
+	 * @param WC_Subscription $subscription The subscription object
+	 * @return int|mixed The meta value cast to integer if it's numeric, otherwise the original value
+	 */
+	public function cast_meta_to_integer( $value, $subscription ) {
+		// Only cast if the value is numeric (could be empty string or null)
+		if ( is_numeric( $value ) ) {
+			return absint( $value );
+		}
+		return $value;
+	}
+	
+	/**
+	 * Cast _paypal_failed_sign_up_recorded meta value to integer when retrieved via get_post_meta
+	 * 
+	 * This is a fallback for cases where meta is accessed directly via get_post_meta()
+	 * rather than through WooCommerce's CRUD API
+	 * 
+	 * @param mixed $value The meta value
+	 * @param int $object_id The object ID
+	 * @param string $meta_key The meta key
+	 * @param bool $single Whether to return a single value
+	 * @return int|mixed The meta value cast to integer if it's numeric and the key matches
+	 */
+	public function cast_post_meta_to_integer( $value, $object_id, $meta_key, $single ) {
+		// Only process our specific meta key
+		if ( '_paypal_failed_sign_up_recorded' !== $meta_key ) {
+			return $value;
+		}
+		
+		// Only cast if the value is numeric (could be empty string or null)
+		if ( is_numeric( $value ) ) {
+			return absint( $value );
+		}
+		return $value;
+	}
+	
 }
 
 /**
